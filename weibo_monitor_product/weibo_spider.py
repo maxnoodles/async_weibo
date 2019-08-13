@@ -3,6 +3,7 @@ import random
 import time
 
 import aiohttp
+from aiostream import stream
 from motor.motor_asyncio import AsyncIOMotorClient
 import aioredis
 import requests
@@ -35,16 +36,18 @@ class WeiBoSpider:
         self.base_url = 'https://m.weibo.cn/api/container/getIndex?&containerid={}&page=1'
         self.client = AsyncIOMotorClient(host='127.0.0.1', port=27017)
 
-        self.col_read = self.client['WeiBo']['true_brand_search_containerid']
+        self.col_read = self.client['WeiBo']['new_brand_name']
         self.col_write = self.client['WeiBo']['weibo_json_temp']
         self.proxy = ''
+
+        self.event = asyncio.Event()
 
     async def start_request(self):
         """
         包装 url 使用协程抓取
         :return:
         """
-        self.r = await aioredis.create_redis_pool(('localhost', 6379), password='noodles')
+        self.r = await aioredis.create_redis_pool(('localhost', 6379))
         cursor = self.col_read.find({})
 
         # 使用代理
@@ -57,18 +60,29 @@ class WeiBoSpider:
         #
         # print(self.proxy)
 
-        async with aiohttp.TCPConnector(limit=300, force_close=True, enable_cleanup_closed=True) as tc:
+        async with aiohttp.TCPConnector(limit=250, force_close=True, enable_cleanup_closed=True) as tc:
             async with aiohttp.ClientSession(connector=tc) as session:
-                coros = [asyncio.create_task(self.fetch(mblog, session)) for mblog in await cursor.to_list(length=None)]
-                # print(len(coros))
+                tasks = (asyncio.create_task(self.fetch(mblog, session)) async for mblog in cursor)
+                await self.branch(tasks)
 
-                # if len(coros) == 0:
-                #     print('mongodb没有数据')
-                #     return False
+    async def branch(self, tasks, limit=950):
+        """异步切片，限制并发"""
+        # index = 0
+        while True:
+            xs = stream.preserve(tasks)
+            ys = xs[0:limit]
+            t = await stream.list(ys)
+            if not t:
+                break
+            await asyncio.create_task(asyncio.wait(t))
 
-                await asyncio.wait(coros)
-                self.r.close()
-                await self.r.wait_closed()
+            print(f'休眠300s')
+            await asyncio.sleep(300)
+            print('休眠结束')
+
+        self.r.close()
+        await self.r.wait_closed()
+        self.client.close
 
     async def fetch(self, mblog, session):
         """
@@ -77,8 +91,9 @@ class WeiBoSpider:
         :param session:
         :return:
         """
+
         url = self.base_url.format(mblog['containerid'])
-        print(url)
+        # print(url)
 
         self.headers.update({'user-agent': random.choice(self.ua_list)})
 
@@ -91,19 +106,21 @@ class WeiBoSpider:
                 # 异步插入mongodb
                 await self.col_write.insert_one({'containerid': mblog['containerid'], 'text': res_text})
                 # 异步插入redis
+                print(f'推入的 {url}')
                 await self.r.lpush('weibo_json', res_text)
             else:
                 print(f'状态码异常，为{res.status}', url)
 
 
 def run():
-    """不能使用 asyncio.run()，和 motor 冲突"""
     print('开始抓取微博数据')
     spider = WeiBoSpider()
     now = time.time()
+    # 不能使用 asyncio.run()，和 motor 冲突
     loop = asyncio.get_event_loop()
     loop.run_until_complete(spider.start_request())
-    loop.close()
+    # 定时执行，不能关闭循环
+    # loop.close()
     times = time.time() - now
     print('抓取微博数据耗时: ', times)
 

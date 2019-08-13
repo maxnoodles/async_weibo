@@ -1,4 +1,3 @@
-import datetime
 import re
 
 import jsonpath
@@ -9,16 +8,21 @@ import json
 import time
 import datetime
 
+from weibo_util import change_time
+
 
 class ParseContent:
 
     def __init__(self):
-        self.rd = redis.StrictRedis(host='127.0.0.1', port=6379, decode_responses=True, password='noodles')
+        self.rd = redis.StrictRedis(host='127.0.0.1', port=6379, decode_responses=True)
         self.redis_list = 'weibo_json'
-        # self.redis_list = 'weibo_json_temp'
 
-        self.to_mysql_keywords = ['全国', '门店', '深圳', '线下', '实体店']
-        self.to_mongodb_keywords = ['折扣', '发布', '限量', '新品', '发售', '特卖', '特惠', '促销', '全新']
+        self.to_mysql_keywords = ['全国', '门店', '深圳', '实体店', '商场'
+                                  '线下商店', '线下精品店', '线下百货', '线下店', '线下专柜', '线下专卖店',
+                                  '线下任意', '线下各大', '线下指定', '线下实体', '线下体验', '线下沙龙']
+
+        self.to_mongodb_keywords = ['折扣', '限量', '新品', '发售', '特卖', '特惠', '促销', '全新', '预售',
+                                    '上新', '活动', '联名', '优惠', '免费', '上市', '首发']
 
         self.valid_flag = 1
         self.mongodb_client = pymongo.MongoClient()
@@ -26,20 +30,29 @@ class ParseContent:
         self.mongodb_to_mysql_col = self.mongodb_client['WeiBo']['to_mysql_msg']
         self.mongodb_valid_col = self.mongodb_client['WeiBo']['valid_msg']
         self.mongodb_invalid_col = self.mongodb_client['WeiBo']['invalid_msg']
-        self.mongodb_brand_col = self.mongodb_client['WeiBo']['new_brand_name']
+        self.mongodb_brand_name_col = self.mongodb_client['WeiBo']['new_brand_name']
+        self.mongodb_brand_database_col = self.mongodb_client['WeiBo']['brand_database']
 
-        self.mysql_db = pymysql.connect(host='localhost', user='root', password='root', db='d88', port=3306)
+        self.mysql_db = pymysql.connect(host='localhost', user='root', password='root', db='d88_localhost', port=3306)
+        self.to_mysql_count = 0
+        self.now_datetime = datetime.datetime.now()
 
-    def get_weibo_json(self):
+    def get_and_parse_weibo_json(self):
         """
         将抓取到的微博 json 数据解析入库。TODO: 可以使用多进程或者异步拓展
-        :return: json or None
         """
-        weibo_json = self.rd.blpop(self.redis_list, timeout=3)
-        if weibo_json is None:
-            print('redis 没有数据了')
-            return None
-        return weibo_json
+        while True:
+            weibo_json = self.rd.blpop(self.redis_list, timeout=350)
+            if weibo_json is None:
+                print('redis 没有数据了')
+                break
+            else:
+                self.parse_weibo_json(weibo_json)
+        # print(f'一共插入往mysql插入 {self.to_mysql_count} 条数据')
+
+        self.mysql_db.commit()
+        self.mysql_db.close()
+        self.mongodb_client.close()
 
     def parse_weibo_json(self, weibo_json):
         """
@@ -47,6 +60,8 @@ class ParseContent:
         :param weibo_json: json
         :return:
         """
+
+        # blpop 获取的是一个元祖 （队列名，数据）
         weibo_json = json.loads(weibo_json[1])
 
         """
@@ -66,22 +81,39 @@ class ParseContent:
         if weibo_json.get('ok'):
             data = weibo_json.get('data')
             cards = data.get('cards')
-            # 抓取标识，抓取时会跳过置顶的微博，为了确保抓到2条有效数据，设置这个变量。
+            # 抓取标识，抓取时会跳过置顶的微博，为了减少无效数据，设置这个变量。
             flag = 0
             for card in cards:
-                if flag == 2:
-                    break
-
+                if flag == 4:
+                    return
+                flag += 1
                 mblog = card.get('mblog')
                 # 跳过置顶和没有文字的微博
                 if not mblog.get('isTop') and mblog.get('text'):
                     mblog_dic = dict()
 
+                    mblog_created_at = mblog.get('created_at')
+                    mblog_created_at = change_time(mblog_created_at)
+
+                    # 如果微博时间距离今日超过15天，不写入数据库
+                    if self.now_datetime - mblog_created_at > datetime.timedelta(days=15):
+                        continue
+
+                    mblog_dic['mblog_created_at'] = mblog_created_at
                     mblog_dic['create_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    mblog_dic['mblog_containerid'] = data.get('cardlistInfo').get('containerid')
                     mblog_dic['mblog_url'] = card.get('scheme')
-                    mblog_dic['mblog_created_at'] = mblog.get('created_at')
                     mblog_dic['mblog_id'] = mblog.get('id')
+
+                    cardlistInfo = data.get('cardlistInfo')
+                    if cardlistInfo:
+                        mblog_dic['mblog_containerid'] = cardlistInfo.get('containerid')
+                    else:
+                        mblog_dic['mblog_containerid'] = ''
+
+                    # 到微博表查询微博名
+                    weibo_info = self.mongodb_brand_name_col.find_one({'containerid': mblog_dic['mblog_containerid']})
+                    if weibo_info is not None:
+                        mblog_dic['weibo_name'] = weibo_info.get('weibo_name')
 
                     # 微博附带的图片列表，方便后续用百度ocr接口识别是否包含关键字
                     # mblog_dic['mblog_pic'] = jsonpath.jsonpath(card, '$..pics..url')
@@ -99,8 +131,9 @@ class ParseContent:
                     # 插入有效的 mysql 表
                     if mongodb_col == 'to_mysql_msg':
                         result = self.save_to_mongodb(mblog_dic, self.mongodb_to_mysql_col)
-                        if result:
-                            self.save_to_mysql(mblog_dic)
+                        # if result:
+                        #     self.save_to_mysql(mblog_dic)
+                        #     self.to_mysql_count += 1
 
                     # 插入有效的 mongodb 表
                     elif mongodb_col == 'valid_msg':
@@ -139,6 +172,9 @@ class ParseContent:
         :param col: Mongodb集合对象
         :return: Bool
         """
+        if '_containerid' not in col.index_information():
+            col.create_index('containerid', name='_containerid')
+
         flag = col.find_one({'mblog_id': dic['mblog_id']})
         if not flag:
             col.insert_one(dic)
@@ -147,20 +183,20 @@ class ParseContent:
 
     def save_to_mysql(self, mblog_dic):
         """
-        将字典转换成写入 Mysql 的行
+        将字典转换成写入 Mysql 的列表数据
         :param mblog_dic: dict
         :return:
         """
-        multiple_store = self.mongodb_brand_col.find({'weibo_containerid': int(mblog_dic['mblog_containerid'])})
-
+        multiple_store = self.mongodb_brand_database_col.find({'weibo_containerid': int(mblog_dic['mblog_containerid'])})
         store_ids = set([store['store_id'] for store in multiple_store])
-
         cursor = self.mysql_db.cursor()
 
+        # format_time = change_time(mblog_dic['mblog_created_at'])
+        weibo_create_time = mblog_dic['mblog_created_at']
+
         # 构建 mysql 所需数据
-        today = datetime.datetime.now()
-        start_time = time.mktime(today.timetuple())
-        end_time = time.mktime((today + datetime.timedelta(days=3)).timetuple())
+        start_time = int(datetime.datetime.timestamp(weibo_create_time))
+        end_time = int(datetime.datetime.timestamp(weibo_create_time + datetime.timedelta(days=15)))
         status = 2
         create_time = int(time.time())
         update_time = int(time.time())
@@ -181,22 +217,21 @@ class ParseContent:
 
 def run():
     now = time.time()
-    p = ParseContent()
+    parse = ParseContent()
 
-    print(f'开始解析 weibo 的 json 数据, 一共 {p.rd.llen(p.redis_list)} 条数据')
+    print(f'开始解析 weibo 的 json 数据, 一共 {parse.rd.llen(parse.redis_list)} 条数据')
+    parse.get_and_parse_weibo_json()
 
-    # while True:
-    #     weibo_json = p.get_weibo_json()
-    #     if weibo_json is None:
-    #         break
-    #     p.parse_weibo_json(weibo_json)
+    # dic = {'create_time': '2019-07-04 12:56:25', 'mblog_containerid': '1076036392766054',
+    #        'mblog_url': 'https://m.weibo.cn/status/HARXVwpXc?' \
+    #                     'mblogid=HARXVwpXc&luicode=10000011&lfid=1076032605762464',
+    #        'mblog_created_at': '06-27',
+    #        'mblog_id': '4387872557726266',
+    #        'mblog_text': ' 好嗨鸥，力度满满的夏季折扣已安排上！精选商品低至6折起，'
+    #                      '官网和线下门店同时进行喔~快把握住机会，更新你的夏日衣橱吧！ ',
+    #        'mblog_keyword': '门店'}
+    # p.save_to_mysql(dic)
 
-    # dic = {'create_time': '2019-07-04 12:56:25', 'mblog_containerid': '1076036392766054', 'mblog_url': 'https://m.weibo.cn/status/HARXVwpXc?mblogid=HARXVwpXc&luicode=10000011&lfid=1076032605762464', 'mblog_created_at': '06-27', 'mblog_id': '4387872557726266', 'mblog_text': ' 好嗨鸥，力度满满的夏季折扣已安排上！精选商品低至6折起，官网和线下门店同时进行喔~快把握住机会，更新你的夏日衣橱吧！ ', 'mblog_keyword': '门店'}
-    # p.to_mysql(dic)
-    # p.save_to_mongodb(dic, p.mongodb_invalid_col)
-
-    p.mysql_db.commit()
-    p.mysql_db.close()
     times = time.time() - now
     print('微博解析耗时: ', times)
 
