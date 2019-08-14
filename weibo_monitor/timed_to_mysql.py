@@ -16,16 +16,10 @@ class TimedToMysql:
                                              cursorclass=pymysql.cursors.DictCursor
                                          )
 
-        # self.mysql_write_db = pymysql.connect(host='localhost',
-        #                                       user='root',
-        #                                       password='root',
-        #                                       db='d88_localhost',
-        #                                       port=3306)
-
-        self.mysql_write_db = pymysql.connect(host='btadmin.d88.ink',
-                                              user='worm_db',
-                                              password='2TAHa6neRMwAeDGh',
-                                              db='worm_db',
+        self.mysql_write_db = pymysql.connect(host='localhost',
+                                              user='root',
+                                              password='root',
+                                              db='d88_localhost',
                                               port=3306)
 
         self.mongodb_client = pymongo.MongoClient()
