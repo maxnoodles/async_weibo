@@ -41,7 +41,7 @@ retry_times = 0
 def get_id(url):
     global retry_times
     while True:
-        proxy = requests.get('http://47.102.147.138:8000/random').text
+        proxy = requests.get('http://xxxx/random').text
         if proxy:
             break
         else:
