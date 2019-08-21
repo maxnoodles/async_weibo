@@ -39,7 +39,7 @@ class ParseContent:
 
     def get_and_parse_weibo_json(self):
         """
-        将抓取到的微博 json 数据解析入库。TODO: 可以使用多进程或者异步拓展
+        将抓取到的微博 json 数据解析入库。
         """
         while True:
             weibo_json = self.rd.blpop(self.redis_list, timeout=350)
