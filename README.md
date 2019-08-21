@@ -22,6 +22,9 @@
 `timed_to_mysql.py` 业务脚本  
 
 
-`weibo_other` 是一些微博的搜索接口和获取微博用户id的脚本文件
+
+
+
+`weibo_other` 这个文件夹里面是一些微博的搜索接口和获取微博用户id的脚本文件
 
 
